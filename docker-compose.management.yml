@@ -1,0 +1,32 @@
+services:
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes", "--save", "60", "1000"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+  manager:
+    build:
+      context: .
+      dockerfile: manager/Dockerfile
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      RESULTS_DIR: /results
+      DATASETS_DIR: /datasets
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./state/results:/results
+      - ./state/datasets:/datasets:rw
+    depends_on:
+      redis:
+        condition: service_healthy
+volumes:
+  redis-data:

@@ -1,0 +1,9 @@
+# Adjust for your specific dataset. Paths are relative to /dataset within container.
+path: /dataset
+train: train/images
+val: valid/images
+names:
+  0: Ajwa
+  1: Class2
+  2: Class3
+  3: Class4
