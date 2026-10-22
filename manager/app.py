@@ -161,6 +161,54 @@ def submit(j:Job,x_api_key:str|None=Header(default=None)):
     with r.lock('claim_lock',timeout=30,blocking_timeout=10):
         save(data);r.lpush('pending',data['id']);r.lpush('jobs_recent',data['id']);r.ltrim('jobs_recent',0,1999)
     return data
+def _clear_children(root):
+    """Clear only files under the configured application storage root."""
+    root=root.resolve(strict=True)
+    if root not in (Path('/results'),Path('/datasets')):
+        # Resolve may return host-independent mount paths; do not follow
+        # a symlink from an expected root to another location.
+        raise HTTPException(409,'Unexpected storage root')
+    count=0
+    for entry in root.iterdir():
+        if entry.is_symlink() or entry.is_file():entry.unlink()
+        elif entry.is_dir():shutil.rmtree(entry)
+        count+=1
+    return count
+
+def _assert_idle_reset():
+    # Stop claiming jobs first; workers must have already finished.
+    for key in r.scan_iter('running:*'):
+        if r.scard(key):raise HTTPException(409,'Running jobs detected; stop workers and retry')
+    for key in r.scan_iter('node:*'):
+        raw=r.get(key)
+        if not raw:continue
+        try:node=json.loads(raw)
+        except (ValueError,TypeError):continue
+        if node.get('current_job') or node.get('current_jobs'):
+            raise HTTPException(409,'A worker reports active training; stop workers and retry')
+
+@app.post('/admin/reset')
+def reset_competition_data(payload:dict,x_api_key:str|None=Header(default=None)):
+    user(x_api_key)
+    if payload.get('confirmation')!='DELETE ALL COMPETITION DATA':
+        raise HTTPException(422,'Confirmation phrase does not match')
+    with r.lock('claim_lock',timeout=120,blocking_timeout=10):
+        r.set('scheduler:paused','1')
+        _assert_idle_reset()
+        # Scope 1: job history, scheduling queue, metrics and training files.
+        keys=['pending','jobs_recent']
+        for pattern in ('job:*','running:*','cancel:*','profile:*','node:reconciled:*','node:quarantine:*'):
+            keys.extend(r.scan_iter(pattern))
+        keys=[key for key in set(keys) if key!='claim_lock']
+        if keys:r.delete(*keys)
+        result_count=_clear_children(results)
+        # Scope 2: competition dataset uploads only.
+        dataset_count=_clear_children(datasets)
+        # Invalidate remote UI state, without modifying worker registrations or keys.
+        generation=r.incr('competition:reset_generation')
+    return {'ok':True,'results_removed':result_count,'datasets_removed':dataset_count,
+            'generation':generation,'paused':True}
+
 @app.get('/jobs')
 def list_jobs(x_api_key:str|None=Header(default=None),limit:int=50):
     user(x_api_key)
