@@ -382,6 +382,45 @@ async def artifact(jobid:str,upload:UploadFile=File(...),x_worker_key:str|None=H
         return {'saved':True,'bytes':size}
     except Exception:
         destination.unlink(missing_ok=True);raise
+# Live training log transport: workers append bounded UTF-8 chunks; clients
+# request only bytes not yet seen. Logs are per-job and never shared by path.
+@app.post('/internal/log/{jobid}')
+def append_job_log(jobid:str, data:dict, x_worker_key:str|None=Header(default=None)):
+    agent(x_worker_key)
+    j=record(jobid)
+    if j.get('node') != data.get('node') or j.get('status') not in ('running','completed','failed','cancelled'):
+        raise HTTPException(409,'Job owner mismatch')
+    chunk=data.get('text')
+    if not isinstance(chunk,str) or len(chunk.encode('utf-8'))>65536:
+        raise HTTPException(413,'Log chunk too large')
+    offset=data.get('offset')
+    if not isinstance(offset,int) or offset<0: raise HTTPException(422,'Invalid log offset')
+    logpath=results/j['student_id']/jobid/'live.log'
+    logpath.parent.mkdir(parents=True,exist_ok=True)
+    with r.lock('log:'+jobid,timeout=20,blocking_timeout=10):
+        current=logpath.stat().st_size if logpath.exists() else 0
+        if offset!=current:
+            return {'offset':current,'resync':True}
+        payload=chunk.encode('utf-8')
+        with logpath.open('ab') as stream:stream.write(payload)
+        return {'offset':current+len(payload),'resync':False}
+
+@app.get('/jobs/{jobid}/log')
+def get_job_log(jobid:str, offset:int=0, limit:int=32768, x_api_key:str|None=Header(default=None)):
+    user(x_api_key)
+    j=record(jobid)
+    if offset<0 or limit<1 or limit>65536:raise HTTPException(422,'Invalid log window')
+    path=results/j['student_id']/jobid/'live.log'
+    if not path.is_file():return {'text':'','offset':0,'more':False}
+    size=path.stat().st_size
+    start=min(offset,size)
+    with path.open('rb') as stream:
+        stream.seek(start)
+        data=stream.read(limit)
+    # Use latin-1 transport to preserve byte offsets on UTF-8 boundaries;
+    # UI decodes via replacement where needed.
+    return {'text':data.decode('utf-8',errors='replace'),'offset':start+len(data),'more':start+len(data)<size}
+
 @app.get('/jobs/{jobid}/artifact')
 def get_artifact(jobid:str,x_api_key:str|None=Header(default=None)):
     user(x_api_key);j=record(jobid)
