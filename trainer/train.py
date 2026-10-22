@@ -22,7 +22,7 @@ def main():
         if not yaml.is_file(): raise SystemExit('Missing /dataset/data.yaml')
         model=YOLO(args.model)
         model.train(data=str(yaml),epochs=args.epochs,imgsz=args.imgsz,batch=args.batch,
-                    project='/output',name='train',exist_ok=True,device=0,workers=2,amp=True)
+                    project='/output',name='train',exist_ok=True,device=0,workers=2,amp=False)
     print('peak_allocated_gib', round(torch.cuda.max_memory_allocated()/1024**3,3),flush=True)
     print('peak_reserved_gib', round(torch.cuda.max_memory_reserved()/1024**3,3),flush=True)
 if __name__=='__main__': main()
