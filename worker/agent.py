@@ -73,6 +73,48 @@ def gpu_used_mib():
     except Exception:
         return None
 
+def forward_live_log(job, logfile_path, finished):
+    """Best-effort incremental log forwarding; never fail the training job."""
+    read_pos=0
+    remote_pos=0
+    while True:
+        try:
+            if logfile_path.is_file():
+                with logfile_path.open('rb') as source:
+                    source.seek(read_pos)
+                    payload=source.read(16000)
+                if payload:
+                    # Most trainer output is ASCII. Read complete UTF-8 codepoints
+                    # so offsets refer to actual bytes stored on the manager.
+                    try:
+                        message=payload.decode('utf-8')
+                    except UnicodeDecodeError as error:
+                        if error.reason=='unexpected end of data' and error.start>0:
+                            payload=payload[:error.start]
+                            message=payload.decode('utf-8',errors='replace')
+                        else:
+                            message=payload.decode('utf-8',errors='replace')
+                    response=post('/internal/log/'+job['id'],
+                                  {'node':NODE,'offset':remote_pos,'text':message},timeout=20)
+                    if response.get('resync'):
+                        # Restart at beginning only if manager lost the log.
+                        expected=int(response['offset'])
+                        if expected==0:
+                            read_pos=remote_pos=0
+                        else:
+                            remote_pos=expected
+                        continue
+                    read_pos+=len(payload)
+                    remote_pos=int(response['offset'])
+                    continue
+        except Exception as exc:
+            print('Log forward warning:',str(exc)[:160],flush=True)
+        if finished.is_set():
+            # Avoid an endless retry loop on a failed manager.
+            break
+        finished.wait(2)
+
+
 def launch(job):
     folder=OUT/job['student_id']/job['id'];folder.mkdir(parents=True,exist_ok=True)
     # Give each job its own unique container name and shared memory.
@@ -109,8 +151,14 @@ def launch(job):
     t=threading.Thread(target=sampler,daemon=True);t.start()
     rc=1
     cancelled=False
+    log_path=folder/'container.log'
+    log_done=threading.Event()
+    log_forwarder=threading.Thread(
+        target=forward_live_log,args=(job,log_path,log_done),
+        daemon=True,name='log-'+job['id'][:8])
+    log_forwarder.start()
     try:
-        with (folder/'container.log').open('w',encoding='utf-8') as logfile:
+        with log_path.open('w',encoding='utf-8') as logfile:
             try:
                 proc=subprocess.Popen(cmd,stdout=logfile,stderr=subprocess.STDOUT)
                 started=time.monotonic()
@@ -134,6 +182,8 @@ def launch(job):
                 raise
     finally:
         stop.set();t.join(timeout=12)
+        log_done.set()
+        log_forwarder.join(timeout=10)
     peak=max(samples) if samples else None
     metrics={'node':NODE,'device':gpu().get('name','unknown'),
              'baseline_gpu_used_mib':baseline,'peak_gpu_used_mib':peak,
