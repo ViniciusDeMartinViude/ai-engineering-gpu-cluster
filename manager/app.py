@@ -219,7 +219,23 @@ def get_job(jobid:str,x_api_key:str|None=Header(default=None)):
 @app.get('/nodes')
 def nodes(x_api_key:str|None=Header(default=None)):
     user(x_api_key)
-    return [json.loads(v) for k in r.scan_iter('node:*') if (v:=r.get(k))]
+    workers=[]
+    for key in r.scan_iter('node:*'):
+        # Only node:<name> holds a heartbeat JSON object; internal keys
+        # such as node:reconciled:<name> contain plain text/timestamps.
+        if key.count(':') != 1:
+            continue
+        value=r.get(key)
+        if not value:
+            continue
+        try:
+            item=json.loads(value)
+        except (json.JSONDecodeError,TypeError):
+            continue
+        if not isinstance(item,dict) or not item.get('node') or not isinstance(item.get('gpu'),dict):
+            continue
+        workers.append(item)
+    return workers
 @app.post('/internal/heartbeat')
 def heartbeat(data:dict,x_worker_key:str|None=Header(default=None)):
     agent(x_worker_key)
