@@ -488,8 +488,21 @@ def get_job_log(jobid:str, offset:int=0, limit:int=32768, x_api_key:str|None=Hea
 @app.get('/jobs/{jobid}/artifact')
 def get_artifact(jobid:str,x_api_key:str|None=Header(default=None)):
     user(x_api_key);j=record(jobid)
-    if not j.get('artifact'):raise HTTPException(404,'No artifact')
-    return FileResponse(results/j['artifact'],filename=jobid+'.zip',media_type='application/zip')
+    if not j.get('artifact'):
+        raise HTTPException(404,'No artifact has been uploaded for this job')
+    # Reject an inconsistent stored path and report missing result files
+    # as a useful 404 rather than letting FileResponse raise HTTP 500.
+    relative=Path(j['artifact'])
+    expected=Path(j['student_id'])/jobid/'output.zip'
+    if relative!=expected:
+        raise HTTPException(409,'Artifact metadata does not match the job')
+    destination=results/relative
+    if not destination.is_file():
+        raise HTTPException(
+            404,'Job artifact file is missing from manager storage. '
+                'Check the results volume or whether competition data was reset.'
+        )
+    return FileResponse(destination,filename=jobid+'.zip',media_type='application/zip')
 
 @app.get('/scheduler/reservations')
 def reservations(x_api_key:str|None=Header(default=None)):
