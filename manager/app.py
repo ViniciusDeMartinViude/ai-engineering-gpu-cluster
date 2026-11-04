@@ -153,6 +153,8 @@ def submit(j:Job,x_api_key:str|None=Header(default=None)):
             raise HTTPException(422,'Source must be a completed training of the same model and student')
         locate_best_checkpoint(ancestor)
     if j.imgsz%32: raise HTTPException(422,'imgsz must be multiple of 32')
+    if j.mode=='train' and j.model=='yolo26s.pt' and j.batch>4:
+        raise HTTPException(422,'YOLO26s batch limited to 4 until profiled')
     # Training admission no longer requires a measured GPU profile.
     # Job parameter ranges and image-size validation are still enforced.
     data=j.model_dump()
