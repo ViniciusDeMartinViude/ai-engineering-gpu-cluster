@@ -19,12 +19,11 @@ DUAL_B01=os.environ.get("ENABLE_DUAL_B01","false").lower() in ("1","true","yes")
 MAX_JOBS=max(1,min(8,int(os.environ.get('GPU_MAX_CONCURRENT_JOBS','1'))))
 EXPERIMENT_LEVEL=max(0,min(2,int(os.environ.get('GPU_EXPERIMENT_LEVEL','0'))))
 def compatible_pair(a,b):
-    # The manager decides capacity under the Redis claim lock.
-    # Fail closed for unprofiled work or stale/old manager replies.
-    return (a.get('reserved_vram_mib') is not None and
-            b.get('reserved_vram_mib') is not None and
-            a.get('admission_policy')=='profiled_shared' and
-            b.get('admission_policy')=='profiled_shared')
+    # Capacity is enforced by the manager under its atomic claim lock.
+    # The manager now permits concurrent jobs without measured profiles;
+    # reject accidental mixing with legacy exclusive jobs.
+    return (a.get('admission_policy')=='slots_and_free_vram' and
+            b.get('admission_policy')=='slots_and_free_vram')
 
 def gpu():
     try:
