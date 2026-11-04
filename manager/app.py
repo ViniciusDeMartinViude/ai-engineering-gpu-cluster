@@ -153,10 +153,13 @@ def submit(j:Job,x_api_key:str|None=Header(default=None)):
             raise HTTPException(422,'Source must be a completed training of the same model and student')
         locate_best_checkpoint(ancestor)
     if j.imgsz%32: raise HTTPException(422,'imgsz must be multiple of 32')
-    # Conservative input limits, NOT hard 4 GiB VRAM enforcement.
-    if j.mode=='train' and j.model=='yolo26s.pt' and j.batch>4: raise HTTPException(422,'YOLO26s batch limited to 4 until profiled')
-    data=j.model_dump();data['memory_profile']=profile_for(j.model,j.imgsz,j.batch) if j.mode=='train' else None
-    data['profile_note']='Measured isolated device delta available for B01/B03 on RTX 5060 only; other configurations run exclusively.'
+    if j.mode=='train' and j.model=='yolo26s.pt' and j.batch>4:
+        raise HTTPException(422,'YOLO26s batch limited to 4 until profiled')
+    # Training admission no longer requires a measured GPU profile.
+    # Job parameter ranges and image-size validation are still enforced.
+    data=j.model_dump()
+    data['memory_profile']=None
+    data['profile_note']='No measured-profile requirement; worker slot limits and live GPU free memory guard still apply.'
     data.update(id=uuid.uuid4().hex,status='queued',node=None,created_at=time.time(),updated_at=time.time(),error=None,artifact=None)
     with r.lock('claim_lock',timeout=30,blocking_timeout=10):
         save(data);r.lpush('pending',data['id']);r.lpush('jobs_recent',data['id']);r.ltrim('jobs_recent',0,1999)
@@ -255,32 +258,41 @@ def heartbeat(data:dict,x_worker_key:str|None=Header(default=None)):
             except HTTPException:pass
         cancel=[jid for jid in actual if r.get('cancel:'+jid)=='1']
     return {'ok':True,'cancel_jobs':cancel,'scheduling_paused':r.get('scheduler:paused')=='1'}
+def student_has_running_job(student_id):
+    """Called while holding claim_lock; check running work across all nodes."""
+    for key in r.scan_iter('running:*'):
+        for job_id in r.smembers(key):
+            try:
+                active=record(job_id)
+            except HTTPException:
+                continue
+            if active.get('status')=='running' and active.get('student_id')==student_id:
+                return True
+    return False
+
 def live_node_candidates(job):
-    """Called under claim_lock; never use un-reconciled or quarantined nodes."""
+    """Select workers by configured slots and observed free GPU memory."""
     eligible=[]
     for key in r.scan_iter('node:*'):
         node=key.split(':',1)[1]
         if ':' in node or r.exists('node:quarantine:'+node) or not r.exists('node:reconciled:'+node):
             continue
         raw=r.get(key)
-        if not raw: continue
+        if not raw:continue
         try:
-            info=json.loads(raw); gpu_info=info['gpu'];total=int(gpu_info['total_mib']);free=int(gpu_info['free_mib'])
-            if total<=0: continue
+            info=json.loads(raw)
+            gpu_info=info['gpu']
+            total=int(gpu_info['total_mib'])
+            free=int(gpu_info['free_mib'])
+            if total<=0 or free<VRAM_HEADROOM_MIB:continue
             limit=node_limit(node,info.get('max_jobs',1))
             running=[record(i) for i in r.smembers('running:'+node)]
             running=[j for j in running if j.get('status')=='running' and j.get('node')==node]
             if len(running)>=limit:continue
-            estimate=estimate_reservation(job,gpu_info.get('name',''))
-            reserved=sum(int(j.get('reserved_vram_mib') or 0) for j in running)
-            if running and (estimate is None or any(j.get('reserved_vram_mib') is None for j in running)):continue
-            if estimate is not None and estimate>4096:continue
-            if running and VRAM_BASELINE_MIB+reserved+estimate+VRAM_HEADROOM_MIB>total:continue
-            if free<VRAM_HEADROOM_MIB+(estimate if estimate is not None else 512):continue
-            if not running and estimate is not None and VRAM_BASELINE_MIB+estimate+VRAM_HEADROOM_MIB>total:continue
-            # Prefer idle nodes, then lower occupancy / reserved fraction.
-            score=(1 if running else 0, reserved/total, len(running)/limit, node)
-            eligible.append((score,node,estimate))
+            # No measured profile, model-specific restriction, or reservation
+            # estimate is required for sharing a worker.
+            score=(1 if running else 0,len(running)/limit,-free,node)
+            eligible.append((score,node,None))
         except (ValueError,TypeError,KeyError,HTTPException):continue
     return sorted(eligible)
 
@@ -298,12 +310,16 @@ def claim(data:dict,x_worker_key:str|None=Header(default=None)):
             try:j=record(jid)
             except HTTPException:r.lrem('pending',1,jid);continue
             if j['status']!='queued':r.lrem('pending',1,jid);continue
+            # Globally enforce one running job per competitor, regardless of
+            # which GPU worker handles this request. Additional jobs stay queued.
+            if student_has_running_job(j['student_id']):
+                continue
             options=live_node_candidates(j)
             if not options or options[0][1]!=node:continue
             _,_,estimate=options[0]
             if r.lrem('pending',1,jid)!=1:continue
             j.update(status='running',node=node,reserved_vram_mib=estimate,
-                     admission_policy='profiled_shared' if estimate is not None else 'exclusive_unprofiled',
+                     admission_policy='slots_and_free_vram',
                      updated_at=time.time(),last_heartbeat=time.time(),attempt=int(j.get('attempt',0))+1)
             save(j);r.sadd('running:'+node,jid)
             return {'job':j}
