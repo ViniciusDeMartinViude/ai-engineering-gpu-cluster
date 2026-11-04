@@ -258,6 +258,18 @@ def heartbeat(data:dict,x_worker_key:str|None=Header(default=None)):
             except HTTPException:pass
         cancel=[jid for jid in actual if r.get('cancel:'+jid)=='1']
     return {'ok':True,'cancel_jobs':cancel,'scheduling_paused':r.get('scheduler:paused')=='1'}
+def student_has_running_job(student_id):
+    """Called while holding claim_lock; check running work across all nodes."""
+    for key in r.scan_iter('running:*'):
+        for job_id in r.smembers(key):
+            try:
+                active=record(job_id)
+            except HTTPException:
+                continue
+            if active.get('status')=='running' and active.get('student_id')==student_id:
+                return True
+    return False
+
 def live_node_candidates(job):
     """Select workers by configured slots and observed free GPU memory."""
     eligible=[]
@@ -298,6 +310,10 @@ def claim(data:dict,x_worker_key:str|None=Header(default=None)):
             try:j=record(jid)
             except HTTPException:r.lrem('pending',1,jid);continue
             if j['status']!='queued':r.lrem('pending',1,jid);continue
+            # Globally enforce one running job per competitor, regardless of
+            # which GPU worker handles this request. Additional jobs stay queued.
+            if student_has_running_job(j['student_id']):
+                continue
             options=live_node_candidates(j)
             if not options or options[0][1]!=node:continue
             _,_,estimate=options[0]
